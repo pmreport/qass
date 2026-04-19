@@ -1,0 +1,1690 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Kas Bersama</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+    <!-- jsPDF + autoTable -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-app.js";
+        import {
+            getFirestore, collection, addDoc, writeBatch, doc, updateDoc, deleteDoc,
+            query, onSnapshot, serverTimestamp
+        } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
+
+        // ╔══════════════════════════════════════════╗
+        // ║  GANTI DENGAN CONFIG FIREBASE KAMU       ║
+        // ╚══════════════════════════════════════════╝
+        const firebaseConfig = {
+            apiKey: "AIzaSyAM4lwoNjWrYJ5Dkkfhms0lsVk3T5WNgxM",
+            authDomain: "qass-e7565.firebaseapp.com",
+            projectId: "qass-e7565",
+            storageBucket: "qass-e7565.firebasestorage.app",
+            messagingSenderId: "990534534243",
+            appId: "1:990534534243:web:ed2af191c9f90f3cf8e456"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const COL = "transaksi";
+
+        // Telegram
+        const tg = window.Telegram?.WebApp;
+        if (tg) { tg.ready(); tg.expand(); }
+        const tgUser = tg?.initDataUnsafe?.user?.first_name || "Anonim";
+
+        // State
+        let currentType = "masuk";
+        let unsubscribe = null;
+        let allDocs = [];   // semua doc dari Firestore (sorted)
+        let editDocId = null; // ID doc yang sedang diedit (null = mode tambah baru)
+
+        const BULAN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+        const BULAN_FULL = ["Januari", "Februari", "Maret", "April", "Mei", "Juni",
+            "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+
+        const TEMPLATES = {
+            masuk: [
+                { label: "Iuran Kas [Bln-Tahun]", value: "Iuran Kas " },
+                { label: "Reimburse Jilid Laporan [Bln-Thn]", value: "Reimburse Jilid Laporan " },
+                { label: "Cair Klaim", value: "Cair Klaim" },
+                { label: "Beli [...]", value: "Beli " },
+            ],
+            keluar: [
+                { label: "Biaya Jilid Laporan [Bln-Tahun]", value: "Biaya Jilid Laporan " },
+                { label: "Beli [...]", value: "Beli " },
+                { label: "Kopi Gen", value: "Kopi Gen" },
+                { label: "Iuran Kas [Bln-Tahun]", value: "Iuran Kas " },
+            ]
+        };
+
+        // ── Format helpers ──
+        const fmt = n => new Intl.NumberFormat("id-ID").format(n);
+        const fmtTgl = str => {
+            if (!str) return "—";
+            const [y, m, d] = str.split("-");
+            return `${parseInt(d)}-${BULAN[parseInt(m) - 1]}-${y}`;
+        };
+        const todayStr = () => {
+            const d = new Date();
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+        };
+        const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+        // Tahun sekarang
+        const thisYear = () => new Date().getFullYear();
+
+        // Cek apakah ada data tahun lalu
+        function getPastYears(docs) {
+            const years = new Set(docs.map(d => (d.tanggal || "").slice(0, 4)).filter(y => y));
+            return [...years].filter(y => parseInt(y) < thisYear()).sort();
+        }
+
+        // ── Realtime listener ──
+        function startListener() {
+            if (unsubscribe) unsubscribe();
+            unsubscribe = onSnapshot(query(collection(db, COL)), snap => {
+                allDocs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                allDocs.sort((a, b) => {
+                    const td = (a.tanggal || "").localeCompare(b.tanggal || "");
+                    if (td !== 0) return td;
+                    return (a.timestamp?.seconds ?? 0) - (b.timestamp?.seconds ?? 0);
+                });
+                renderAll(allDocs);
+                checkArchiveBanner(allDocs);
+            }, err => showToast("⚠️ " + err.message));
+        }
+
+        // ── Cek & tampil banner arsip ──
+        function checkArchiveBanner(docs) {
+            const pastYears = getPastYears(docs);
+            const banner = document.getElementById("archiveBanner");
+            const yearList = document.getElementById("archiveYearList");
+            if (pastYears.length) {
+                yearList.innerHTML = pastYears.map(y =>
+                    `<button class="btn-year" onclick="openArchiveModal('${y}')">${y}</button>`
+                ).join("");
+                banner.style.display = "flex";
+            } else {
+                banner.style.display = "none";
+            }
+        }
+
+        // ── Render tabel ──
+        function renderAll(docs) {
+            let totalIn = 0, totalOut = 0, running = 0;
+            const rows = docs.map((d, i) => {
+                const amt = Number(d.amount) || 0;
+                if (d.type === "masuk") { totalIn += amt; running += amt; }
+                if (d.type === "keluar") { totalOut += amt; running -= amt; }
+                return { ...d, no: i + 1, balance: running };
+            });
+
+            const saldoEl = document.getElementById("saldo");
+            saldoEl.textContent = "Rp " + fmt(running);
+            saldoEl.style.color = running < 0 ? "var(--red)" : "var(--text)";
+            saldoEl.classList.remove("pulse"); void saldoEl.offsetWidth; saldoEl.classList.add("pulse");
+            document.getElementById("statIn").textContent = fmt(totalIn);
+            document.getElementById("statOut").textContent = fmt(totalOut);
+            document.getElementById("txCount").textContent = rows.length + " transaksi";
+
+            const list = document.getElementById("txList");
+            if (!rows.length) {
+                list.innerHTML = `<div class="empty"><div class="ei">📭</div><p>Belum ada transaksi</p><span>Tap In atau Out untuk mulai</span></div>`;
+                return;
+            }
+
+            const rev = [...rows].reverse();
+            list.innerHTML = `
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr>
+              <th class="th-no">No</th>
+              <th class="th-tgl">Tanggal</th>
+              <th class="th-in">In</th>
+              <th class="th-out">Out</th>
+              <th class="th-bal">Balance</th>
+              <th class="th-rem">Remark</th>
+            </tr></thead>
+            <tbody>
+              ${rev.map((d, i) => {
+                const isMasuk = d.type === "masuk";
+                return `
+                <tr class="trow" style="animation-delay:${Math.min(i * 15, 150)}ms" onclick="openRowAction('${d.id}')">
+                  <td class="td-no">${d.no}</td>
+                  <td class="td-tgl">${esc(fmtTgl(d.tanggal))}</td>
+                  <td class="td-in">${isMasuk ? `<span class="v-in">${fmt(d.amount)}</span>` : `<span class="v-nil">-</span>`}</td>
+                  <td class="td-out">${!isMasuk ? `<span class="v-out">${fmt(d.amount)}</span>` : `<span class="v-nil">-</span>`}</td>
+                  <td class="td-bal ${d.balance < 0 ? "neg" : ""}">${fmt(d.balance)}</td>
+                  <td class="td-rem">${esc(d.note)}</td>
+                </tr>`;
+            }).join("")}
+            </tbody>
+          </table>
+        </div>`;
+        }
+
+        // ── Arsip Modal ──
+        let archiveYear = null;
+
+        function openArchiveModal(year) {
+            archiveYear = year;
+            const docs = allDocs.filter(d => (d.tanggal || "").startsWith(year));
+
+            // Hitung ringkasan untuk tahun tsb
+            let tIn = 0, tOut = 0;
+            docs.forEach(d => {
+                if (d.type === "masuk") tIn += Number(d.amount) || 0;
+                if (d.type === "keluar") tOut += Number(d.amount) || 0;
+            });
+
+            document.getElementById("archiveYear").textContent = year;
+            document.getElementById("archiveCount").textContent = docs.length;
+            document.getElementById("archiveTotalIn").textContent = "Rp " + fmt(tIn);
+            document.getElementById("archiveTotalOut").textContent = "Rp " + fmt(tOut);
+            document.getElementById("archiveNet").textContent = "Rp " + fmt(tIn - tOut);
+            document.getElementById("archiveNet").style.color = (tIn - tOut) < 0 ? "var(--red)" : "var(--green)";
+
+            document.getElementById("overlayArchive").classList.add("open");
+            tg?.HapticFeedback?.impactOccurred("medium");
+        }
+        window.openArchiveModal = openArchiveModal;
+
+        function closeArchiveModal() {
+            document.getElementById("overlayArchive").classList.remove("open");
+        }
+        window.closeArchiveModal = closeArchiveModal;
+
+        // ── Generate PDF ──
+        function generatePDF(year, docs) {
+            const { jsPDF } = window.jspdf;
+            const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+
+            // Hitung running balance untuk docs tahun ini (dari awal)
+            // Cari balance sebelum tahun ini dari allDocs
+            let runningBefore = 0;
+            allDocs.forEach(d => {
+                if ((d.tanggal || "") < `${year}-01-01`) {
+                    const amt = Number(d.amount) || 0;
+                    if (d.type === "masuk") runningBefore += amt;
+                    if (d.type === "keluar") runningBefore -= amt;
+                }
+            });
+
+            let running = runningBefore;
+            let totalIn = 0, totalOut = 0;
+            const rows = docs.map((d, i) => {
+                const amt = Number(d.amount) || 0;
+                if (d.type === "masuk") { totalIn += amt; running += amt; }
+                if (d.type === "keluar") { totalOut += amt; running -= amt; }
+                return {
+                    no: i + 1,
+                    tanggal: fmtTgl(d.tanggal),
+                    in: d.type === "masuk" ? fmt(amt) : "",
+                    out: d.type === "keluar" ? fmt(amt) : "",
+                    balance: fmt(running),
+                    note: d.note || "",
+                    balNum: running
+                };
+            });
+
+            const pageW = pdf.internal.pageSize.getWidth();
+
+            // ── JUDUL ──
+            pdf.setFillColor(255, 255, 255);
+            pdf.setFont("helvetica", "bold");
+            pdf.setFontSize(14);
+            pdf.setTextColor(20, 20, 20);
+            pdf.text(`Rekapitulasi Dana Kas - Terminal 3 Jakarta`, pageW / 2, 18, { align: "center" });
+
+            pdf.setFontSize(10);
+            pdf.setFont("helvetica", "normal");
+            pdf.setTextColor(80, 80, 80);
+            pdf.text(`Tahun ${year}  ·  Dicetak: ${new Date().toLocaleDateString("id-ID", { day: "numeric", month: "long", year: "numeric" })}  ·  Oleh: ${tgUser}`, pageW / 2, 24, { align: "center" });
+
+            // ── TABEL ──
+            const yellow = [255, 214, 0];
+            const yellowDim = [255, 240, 150];
+            const greenBg = [220, 255, 235];
+            const redBg = [255, 220, 220];
+            const headerTxt = [30, 30, 30];
+            const altRow = [248, 248, 252];
+
+            pdf.autoTable({
+                startY: 30,
+                head: [["No", "Date", "In (Rp)", "Out (Rp)", "Balance (Rp)", "Remark"]],
+                body: rows.map(r => [r.no, r.tanggal, r.in, r.out, r.balance, r.note]),
+                foot: [[
+                    "", "TOTAL",
+                    fmt(totalIn),
+                    fmt(totalOut),
+                    fmt(totalIn - totalOut + runningBefore),
+                    ""
+                ]],
+                styles: {
+                    fontSize: 9,
+                    cellPadding: { top: 2.5, right: 4, bottom: 2.5, left: 4 },
+                    lineColor: [210, 210, 210],
+                    lineWidth: 0.2,
+                    font: "helvetica"
+                },
+                headStyles: {
+                    fillColor: yellow,
+                    textColor: headerTxt,
+                    fontStyle: "bold",
+                    halign: "center",
+                    fontSize: 9.5
+                },
+                footStyles: {
+                    fillColor: [240, 240, 240],
+                    textColor: [20, 20, 20],
+                    fontStyle: "bold",
+                    fontSize: 9.5
+                },
+                columnStyles: {
+                    0: { halign: "center", cellWidth: 12 },       // No
+                    1: { cellWidth: 30 },                         // Date
+                    2: { halign: "right", cellWidth: 38 },        // In
+                    3: { halign: "right", cellWidth: 38 },        // Out
+                    4: { halign: "right", cellWidth: 42 },        // Balance
+                    5: { cellWidth: "auto" }                      // Remark
+                },
+                alternateRowStyles: { fillColor: altRow },
+                // Warna baris: in = hijau muda, out = merah muda, balance negatif = merah
+                didParseCell: (data) => {
+                    if (data.section === "body") {
+                        const row = rows[data.row.index];
+                        if (!row) return;
+                        // kolom In
+                        if (data.column.index === 2 && row.in) data.cell.styles.textColor = [0, 140, 80];
+                        // kolom Out
+                        if (data.column.index === 3 && row.out) data.cell.styles.textColor = [200, 40, 40];
+                        // kolom Balance negatif
+                        if (data.column.index === 4 && row.balNum < 0) data.cell.styles.textColor = [200, 40, 40];
+                    }
+                },
+                margin: { left: 10, right: 10 },
+                tableLineColor: [180, 180, 180],
+                tableLineWidth: 0.3,
+            });
+
+            // ── RINGKASAN di bawah tabel ──
+            const finalY = pdf.lastAutoTable.finalY + 6;
+            pdf.setFontSize(8.5);
+            pdf.setTextColor(100, 100, 100);
+            pdf.text(
+                `Total Pemasukan: Rp ${fmt(totalIn)}   |   Total Pengeluaran: Rp ${fmt(totalOut)}   |   Net: Rp ${fmt(totalIn - totalOut)}`,
+                pageW / 2, finalY, { align: "center" }
+            );
+
+            return pdf;
+        }
+
+        // ── Tombol: Preview & Download PDF ──
+        async function doArchivePDF() {
+            if (!archiveYear) return;
+            const docs = allDocs.filter(d => (d.tanggal || "").startsWith(archiveYear));
+            if (!docs.length) { showToast("⚠️ Tidak ada data untuk tahun ini"); return; }
+
+            showToast("⏳ Membuat PDF…");
+            try {
+                const pdf = generatePDF(archiveYear, docs);
+                pdf.save(`Kas_${archiveYear}.pdf`);
+                showToast("✅ PDF berhasil diunduh");
+            } catch (e) {
+                showToast("❌ Gagal buat PDF: " + e.message);
+            }
+        }
+        window.doArchivePDF = doArchivePDF;
+
+        // ── Tombol: Download PDF lalu hapus data ──
+        async function doArchiveAndDelete() {
+            if (!archiveYear) return;
+            const docs = allDocs.filter(d => (d.tanggal || "").startsWith(archiveYear));
+            if (!docs.length) { showToast("⚠️ Tidak ada data"); return; }
+
+            const btn = document.getElementById("btnDeleteAfter");
+            btn.disabled = true;
+            btn.textContent = "Memproses…";
+
+            try {
+                // 1. Generate & download PDF dulu
+                showToast("⏳ Membuat PDF…");
+                const pdf = generatePDF(archiveYear, docs);
+                pdf.save(`Kas_${archiveYear}.pdf`);
+
+                // 2. Tunggu sebentar agar download sempat dimulai
+                await new Promise(r => setTimeout(r, 800));
+
+                // 3. Hapus dokumen dari Firestore (batch max 500)
+                showToast("🗑️ Menghapus data lama…");
+                const CHUNK = 490;
+                for (let i = 0; i < docs.length; i += CHUNK) {
+                    const batch = writeBatch(db);
+                    docs.slice(i, i + CHUNK).forEach(d => batch.delete(doc(db, COL, d.id)));
+                    await batch.commit();
+                }
+
+                tg?.HapticFeedback?.notificationOccurred("success");
+                showToast(`✅ Arsip ${archiveYear} selesai, data dihapus`);
+                closeArchiveModal();
+            } catch (e) {
+                showToast("❌ Error: " + e.message);
+                tg?.HapticFeedback?.notificationOccurred("error");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "📥 Download PDF & Hapus Data";
+            }
+        }
+        window.doArchiveAndDelete = doArchiveAndDelete;
+
+        // ── Input form ──
+        function onSelectTemplate(val) {
+            if (!val) return;
+            const inp = document.getElementById("inputKet");
+            inp.value = val;
+            inp.focus();
+            inp.setSelectionRange(inp.value.length, inp.value.length);
+        }
+        window.onSelectTemplate = onSelectTemplate;
+
+        async function submitForm() {
+            const tanggal = document.getElementById("inputTanggal").value;
+            const amount = parseInt(document.getElementById("inputNominal").value);
+            const note = document.getElementById("inputKet").value.trim();
+            const btn = document.getElementById("btnSubmit");
+
+            if (!tanggal) { shakeEl("inputTanggal"); showToast("⚠️ Tanggal harus diisi"); return; }
+            if (!amount || amount <= 0) { shakeEl("inputNominal"); showToast("⚠️ Nominal harus diisi"); return; }
+            if (!note) { shakeEl("inputKet"); showToast("⚠️ Keterangan harus diisi"); return; }
+
+            btn.disabled = true; btn.textContent = "Menyimpan…";
+            try {
+                if (editDocId) {
+                    // Mode EDIT — update dokumen yang ada
+                    await updateDoc(doc(db, COL, editDocId), { type: currentType, amount, note, tanggal });
+                    tg?.HapticFeedback?.notificationOccurred("success");
+                    showToast("✅ Transaksi diperbarui");
+                } else {
+                    // Mode TAMBAH — buat dokumen baru
+                    await addDoc(collection(db, COL), {
+                        type: currentType, amount, note, tanggal,
+                        user: tgUser, timestamp: serverTimestamp()
+                    });
+                    tg?.HapticFeedback?.notificationOccurred("success");
+                    showToast(currentType === "masuk" ? "✅ Pemasukan disimpan" : "✅ Pengeluaran disimpan");
+                }
+                closeModal();
+            } catch (e) {
+                showToast("❌ Gagal: " + e.message);
+                tg?.HapticFeedback?.notificationOccurred("error");
+            } finally {
+                btn.disabled = false;
+                btn.textContent = currentType === "masuk" ? "Simpan Pemasukan" : "Simpan Pengeluaran";
+            }
+        }
+
+        function openModal(type) {
+            currentType = type;
+            const isMasuk = type === "masuk";
+            document.getElementById("modalTitle").textContent = isMasuk ? "↑ Uang Masuk" : "↓ Uang Keluar";
+            const btn = document.getElementById("btnSubmit");
+            btn.textContent = isMasuk ? "Simpan Pemasukan" : "Simpan Pengeluaran";
+            btn.dataset.type = type;
+            editDocId = null; // reset mode edit
+            document.getElementById("inputTanggal").value = todayStr();
+            document.getElementById("inputNominal").value = "";
+            document.getElementById("inputKet").value = "";
+            const sel = document.getElementById("ketSelect");
+            sel.innerHTML = `<option value="">— Pilih template (opsional) —</option>` +
+                TEMPLATES[type].map(t => `<option value="${esc(t.value)}">${esc(t.label)}</option>`).join("");
+            document.getElementById("overlay").classList.add("open");
+            setTimeout(() => document.getElementById("inputTanggal").focus(), 320);
+            tg?.HapticFeedback?.impactOccurred("medium");
+        }
+
+        function closeModal() {
+            document.getElementById("overlay").classList.remove("open");
+            document.getElementById("inputNominal").blur();
+            document.getElementById("inputKet").blur();
+        }
+
+        let _tt;
+        function showToast(msg) {
+            const el = document.getElementById("toast");
+            el.textContent = msg; el.classList.add("show");
+            clearTimeout(_tt); _tt = setTimeout(() => el.classList.remove("show"), 2800);
+        }
+
+        function shakeEl(id) {
+            const el = document.getElementById(id);
+            el.style.borderColor = "var(--red)";
+            el.animate([
+                { transform: "translateX(0)" }, { transform: "translateX(-5px)" },
+                { transform: "translateX(5px)" }, { transform: "translateX(-3px)" },
+                { transform: "translateX(0)" }
+            ], { duration: 280, easing: "ease" });
+            setTimeout(() => el.style.borderColor = "", 900);
+        }
+
+        // ── Row action sheet (tap baris) ──
+        function openRowAction(docId) {
+            const d = allDocs.find(x => x.id === docId);
+            if (!d) return;
+            document.getElementById("rowActionTitle").textContent =
+                `${d.type === "masuk" ? "↑" : "↓"} ${fmtTgl(d.tanggal)} · Rp ${fmt(Number(d.amount))}`;
+            document.getElementById("rowActionSub").textContent = d.note;
+            document.getElementById("btnEditRow").onclick = () => { closeRowAction(); openEditModal(docId); };
+            document.getElementById("btnDeleteRow").onclick = () => { closeRowAction(); confirmDelete(docId); };
+            document.getElementById("overlayRowAction").classList.add("open");
+            tg?.HapticFeedback?.impactOccurred("light");
+        }
+        function closeRowAction() {
+            document.getElementById("overlayRowAction").classList.remove("open");
+        }
+        window.openRowAction = openRowAction;
+        window.closeRowAction = closeRowAction;
+
+        // ── Edit modal ──
+        function openEditModal(docId) {
+            const d = allDocs.find(x => x.id === docId);
+            if (!d) return;
+            editDocId = docId;
+            currentType = d.type;
+
+            document.getElementById("modalTitle").textContent = d.type === "masuk" ? "✏️ Edit Pemasukan" : "✏️ Edit Pengeluaran";
+            const btn = document.getElementById("btnSubmit");
+            btn.textContent = "Simpan Perubahan";
+            btn.dataset.type = d.type;
+
+            document.getElementById("inputTanggal").value = d.tanggal || todayStr();
+            document.getElementById("inputNominal").value = d.amount || "";
+            document.getElementById("inputKet").value = d.note || "";
+
+            const sel = document.getElementById("ketSelect");
+            sel.innerHTML = `<option value="">— Pilih template (opsional) —</option>` +
+                TEMPLATES[d.type].map(t => `<option value="${esc(t.value)}">${esc(t.label)}</option>`).join("");
+
+            document.getElementById("overlay").classList.add("open");
+            setTimeout(() => document.getElementById("inputNominal").focus(), 320);
+            tg?.HapticFeedback?.impactOccurred("medium");
+        }
+
+        // ── Confirm delete ──
+        function confirmDelete(docId) {
+            const d = allDocs.find(x => x.id === docId);
+            if (!d) return;
+            document.getElementById("confirmDeleteDesc").textContent =
+                `${fmtTgl(d.tanggal)} · ${d.type === "masuk" ? "+" : "-"}Rp ${fmt(Number(d.amount))} · ${d.note}`;
+            document.getElementById("btnConfirmDelete").onclick = () => doDelete(docId);
+            document.getElementById("overlayConfirm").classList.add("open");
+            tg?.HapticFeedback?.impactOccurred("medium");
+        }
+        function closeConfirm() {
+            document.getElementById("overlayConfirm").classList.remove("open");
+        }
+        window.closeConfirm = closeConfirm;
+
+        async function doDelete(docId) {
+            const btn = document.getElementById("btnConfirmDelete");
+            btn.disabled = true; btn.textContent = "Menghapus…";
+            try {
+                await deleteDoc(doc(db, COL, docId));
+                tg?.HapticFeedback?.notificationOccurred("success");
+                showToast("🗑️ Transaksi dihapus");
+                closeConfirm();
+            } catch (e) {
+                showToast("❌ Gagal hapus: " + e.message);
+                tg?.HapticFeedback?.notificationOccurred("error");
+            } finally {
+                btn.disabled = false; btn.textContent = "Ya, Hapus";
+            }
+        }
+
+        window.openModal = openModal;
+        window.closeModal = closeModal;
+        window.submitForm = submitForm;
+
+        document.addEventListener("keydown", e => {
+            if (e.key === "Enter" && document.getElementById("overlay").classList.contains("open")) submitForm();
+            if (e.key === "Escape") {
+                closeModal();
+                closeArchiveModal();
+                closeRowAction();
+                closeConfirm();
+            }
+        });
+        document.getElementById("overlay").addEventListener("click", e => {
+            if (e.target === document.getElementById("overlay")) closeModal();
+        });
+        document.getElementById("overlayArchive").addEventListener("click", e => {
+            if (e.target === document.getElementById("overlayArchive")) closeArchiveModal();
+        });
+        document.getElementById("overlayRowAction").addEventListener("click", e => {
+            if (e.target === document.getElementById("overlayRowAction")) closeRowAction();
+        });
+        document.getElementById("overlayConfirm").addEventListener("click", e => {
+            if (e.target === document.getElementById("overlayConfirm")) closeConfirm();
+        });
+
+        document.getElementById("tgUser").textContent = "Halo, " + tgUser;
+        startListener();
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=Outfit:wght@300;400;500;600;700&display=swap');
+
+        :root {
+            --bg: #0e1117;
+            --s1: #161b27;
+            --s2: #1c2335;
+            --s3: #212840;
+            --border: #252e42;
+            --text: #e8eeff;
+            --muted: #5e6e92;
+            --accent: #6b9fff;
+            --green: #3ddfa0;
+            --green-b: #0c2a1c;
+            --red: #ff6b6b;
+            --red-b: #2a0e0e;
+            --amber: #fbbf24;
+            --amber-b: #2a1f05;
+            --r: 14px;
+            --r-sm: 9px;
+        }
+
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        html {
+            height: 100%;
+        }
+
+        body {
+            min-height: 100vh;
+            min-height: -webkit-fill-available;
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Outfit', sans-serif;
+            display: flex;
+            flex-direction: column;
+            overscroll-behavior: none;
+        }
+
+        /* HEADER */
+        .header {
+            padding: 16px 16px 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        .logo {
+            width: 36px;
+            height: 36px;
+            background: linear-gradient(135deg, #6b9fff, #4a7fff);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            box-shadow: 0 4px 14px rgba(107, 159, 255, .25);
+            flex-shrink: 0;
+        }
+
+        .header h1 {
+            font-family: 'Syne', sans-serif;
+            font-size: 15px;
+            font-weight: 700;
+            letter-spacing: -.2px;
+        }
+
+        .header p {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 1px;
+        }
+
+        /* SALDO CARD */
+        .card {
+            margin: 12px 12px 0;
+            background: var(--s1);
+            border: 1px solid var(--border);
+            border-radius: var(--r);
+            padding: 14px 16px 12px;
+            flex-shrink: 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card::after {
+            content: '';
+            position: absolute;
+            top: -30px;
+            right: -30px;
+            width: 120px;
+            height: 120px;
+            background: radial-gradient(circle, rgba(107, 159, 255, .07) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .saldo-lbl {
+            font-size: 10px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 1.1px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        #saldo {
+            font-family: 'Syne', sans-serif;
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: -1px;
+            line-height: 1;
+            transition: color .3s;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1
+            }
+
+            40% {
+                opacity: .45
+            }
+        }
+
+        #saldo.pulse {
+            animation: pulse .35s ease;
+        }
+
+        .stats {
+            display: flex;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border);
+        }
+
+        .stat {
+            flex: 1;
+        }
+
+        .stat+.stat {
+            border-left: 1px solid var(--border);
+            padding-left: 12px;
+        }
+
+        .stat-val {
+            font-family: 'Syne', sans-serif;
+            font-size: 11.5px;
+            font-weight: 700;
+        }
+
+        .stat-val.g {
+            color: var(--green);
+        }
+
+        .stat-val.r {
+            color: var(--red);
+        }
+
+        .stat-lbl {
+            font-size: 9.5px;
+            color: var(--muted);
+            margin-top: 2px;
+        }
+
+        /* ARCHIVE BANNER */
+        #archiveBanner {
+            display: none;
+            margin: 8px 12px 0;
+            background: var(--amber-b);
+            border: 1px solid var(--amber);
+            border-radius: var(--r-sm);
+            padding: 10px 14px;
+            align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        .archive-icon {
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .archive-text {
+            flex: 1;
+        }
+
+        .archive-text strong {
+            font-size: 12.5px;
+            font-weight: 600;
+            color: var(--amber);
+            display: block;
+        }
+
+        .archive-text span {
+            font-size: 11px;
+            color: var(--muted);
+        }
+
+        #archiveYearList {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-top: 6px;
+        }
+
+        .btn-year {
+            background: var(--amber);
+            color: #1a1000;
+            border: none;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 12px;
+            font-weight: 700;
+            font-family: 'Syne', sans-serif;
+            cursor: pointer;
+            transition: filter .15s;
+        }
+
+        .btn-year:active {
+            filter: brightness(.85);
+        }
+
+        /* ACTIONS */
+        .actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            padding: 10px 12px;
+            flex-shrink: 0;
+        }
+
+        .btn-action {
+            padding: 13px 10px;
+            border: none;
+            border-radius: var(--r);
+            font-family: 'Syne', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            transition: transform .12s, filter .12s;
+        }
+
+        .btn-action:active {
+            transform: scale(.95);
+            filter: brightness(.85);
+        }
+
+        .btn-masuk {
+            background: var(--green);
+            color: #071a10;
+        }
+
+        .btn-keluar {
+            background: var(--red);
+            color: #1a0707;
+        }
+
+        .btn-icon {
+            font-size: 16px;
+            font-family: monospace;
+        }
+
+        /* LIST META */
+        .list-meta {
+            padding: 2px 16px 5px;
+            font-size: 10px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
+
+        .live-dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            background: var(--green);
+            border-radius: 50%;
+            margin-right: 5px;
+            animation: blink 2s ease infinite;
+        }
+
+        @keyframes blink {
+
+            0%,
+            100% {
+                opacity: 1
+            }
+
+            50% {
+                opacity: .2
+            }
+        }
+
+        /* TABLE */
+        .tx-list {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding-bottom: 80px;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .tx-list::-webkit-scrollbar {
+            display: none;
+        }
+
+        .tbl-wrap {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .tbl {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11.5px;
+            min-width: 360px;
+        }
+
+        .tbl thead tr {
+            background: var(--s3);
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }
+
+        .tbl th {
+            padding: 7px 6px;
+            font-size: 9.5px;
+            font-weight: 700;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: .6px;
+            border-bottom: 2px solid var(--border);
+            white-space: nowrap;
+            user-select: none;
+        }
+
+        .th-no {
+            width: 26px;
+            text-align: center;
+            padding-left: 8px;
+        }
+
+        .th-tgl {
+            width: 70px;
+        }
+
+        .th-in,
+        .th-out,
+        .th-bal {
+            text-align: right;
+            width: 72px;
+        }
+
+        .th-rem {
+            text-align: left;
+            min-width: 90px;
+        }
+
+        .trow {
+            border-bottom: 1px solid var(--border);
+            opacity: 0;
+            animation: fadein .18s ease forwards;
+        }
+
+        .trow:last-child {
+            border-bottom: none;
+        }
+
+        .trow:nth-child(even) td {
+            background: rgba(255, 255, 255, .013);
+        }
+
+        @keyframes fadein {
+            to {
+                opacity: 1;
+            }
+        }
+
+        .tbl td {
+            padding: 7px 6px;
+            vertical-align: middle;
+        }
+
+        .td-no {
+            text-align: center;
+            color: var(--muted);
+            font-size: 10px;
+            padding-left: 8px;
+        }
+
+        .td-tgl {
+            color: var(--muted);
+            font-size: 10.5px;
+            white-space: nowrap;
+        }
+
+        .td-in,
+        .td-out,
+        .td-bal {
+            text-align: right;
+            white-space: nowrap;
+        }
+
+        .v-in {
+            color: var(--green);
+            font-weight: 600;
+        }
+
+        .v-out {
+            color: var(--red);
+            font-weight: 600;
+        }
+
+        .v-nil {
+            color: var(--border);
+        }
+
+        .td-bal {
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .td-bal.neg {
+            color: var(--red);
+        }
+
+        .td-rem {
+            color: var(--text);
+            max-width: 120px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* EMPTY */
+        .empty {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--muted);
+        }
+
+        .ei {
+            font-size: 36px;
+            margin-bottom: 10px;
+        }
+
+        .empty p {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text);
+            margin-bottom: 5px;
+        }
+
+        .empty span {
+            font-size: 11px;
+        }
+
+        /* MODAL (shared base) */
+        .overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, .72);
+            backdrop-filter: blur(5px);
+            z-index: 100;
+            display: flex;
+            align-items: flex-end;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity .22s ease;
+        }
+
+        .overlay.open {
+            opacity: 1;
+            pointer-events: all;
+        }
+
+        .modal {
+            background: var(--s1);
+            border-radius: 20px 20px 0 0;
+            border-top: 1px solid var(--border);
+            width: 100%;
+            padding-bottom: env(safe-area-inset-bottom, 0);
+            transform: translateY(100%);
+            transition: transform .28s cubic-bezier(.32, .72, 0, 1);
+        }
+
+        .overlay.open .modal {
+            transform: translateY(0);
+        }
+
+        .handle {
+            width: 34px;
+            height: 4px;
+            background: var(--border);
+            border-radius: 2px;
+            margin: 10px auto 0;
+        }
+
+        .modal-hd {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 18px 8px;
+        }
+
+        .modal-hd-title {
+            font-family: 'Syne', sans-serif;
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        .modal-close {
+            width: 28px;
+            height: 28px;
+            background: var(--s2);
+            border: none;
+            border-radius: 50%;
+            color: var(--muted);
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+        }
+
+        .modal-close:active {
+            background: var(--border);
+        }
+
+        .modal-body {
+            padding: 0 18px 16px;
+        }
+
+        /* ARCHIVE MODAL specifics */
+        .archive-summary {
+            background: var(--s2);
+            border-radius: var(--r-sm);
+            border: 1px solid var(--border);
+            padding: 12px 14px;
+            margin-bottom: 14px;
+        }
+
+        .archive-summary h3 {
+            font-family: 'Syne', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--amber);
+            margin-bottom: 8px;
+        }
+
+        .sum-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            padding: 3px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sum-row:last-child {
+            border-bottom: none;
+        }
+
+        .sum-label {
+            color: var(--muted);
+        }
+
+        .sum-val {
+            font-weight: 600;
+        }
+
+        .archive-warning {
+            background: var(--red-b);
+            border: 1px solid var(--red);
+            border-radius: var(--r-sm);
+            padding: 10px 12px;
+            font-size: 11.5px;
+            color: var(--red);
+            margin-bottom: 12px;
+            line-height: 1.5;
+        }
+
+        .btn-archive-pdf {
+            width: 100%;
+            padding: 12px;
+            border: 1.5px solid var(--accent);
+            background: transparent;
+            border-radius: var(--r);
+            font-family: 'Syne', sans-serif;
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--accent);
+            cursor: pointer;
+            transition: background .15s;
+            margin-bottom: 8px;
+        }
+
+        .btn-archive-pdf:active {
+            background: rgba(107, 159, 255, .1);
+        }
+
+        .btn-archive-delete {
+            width: 100%;
+            padding: 13px;
+            border: none;
+            border-radius: var(--r);
+            background: var(--red);
+            color: #1a0707;
+            font-family: 'Syne', sans-serif;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: filter .15s;
+        }
+
+        .btn-archive-delete:active {
+            filter: brightness(.85);
+        }
+
+        .btn-archive-delete:disabled {
+            opacity: .45;
+            cursor: default;
+        }
+
+        /* FIELDS (entry modal) */
+        .field {
+            margin-bottom: 10px;
+        }
+
+        .field label {
+            display: block;
+            font-size: 10px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: .9px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .field input,
+        .field select {
+            width: 100%;
+            background: var(--bg);
+            border: 1.5px solid var(--border);
+            border-radius: var(--r-sm);
+            padding: 11px 12px;
+            font-family: 'Outfit', sans-serif;
+            font-size: 15px;
+            color: var(--text);
+            outline: none;
+            transition: border-color .2s;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+
+        .field input:focus,
+        .field select:focus {
+            border-color: var(--accent);
+        }
+
+        .field input::placeholder {
+            color: var(--border);
+        }
+
+        .sel-wrap {
+            position: relative;
+        }
+
+        .sel-wrap::after {
+            content: "▾";
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--muted);
+            font-size: 13px;
+            pointer-events: none;
+        }
+
+        .field select {
+            cursor: pointer;
+            padding-right: 30px;
+        }
+
+        .field select option {
+            background: var(--s2);
+            color: var(--text);
+        }
+
+        #inputTanggal {
+            color-scheme: dark;
+        }
+
+        #inputNominal {
+            font-family: 'Syne', sans-serif;
+            font-size: 22px;
+            font-weight: 800;
+            letter-spacing: -1px;
+        }
+
+        .btn-submit {
+            width: 100%;
+            padding: 13px;
+            border: none;
+            border-radius: var(--r);
+            font-family: 'Syne', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: transform .1s, filter .1s;
+            margin-top: 4px;
+        }
+
+        .btn-submit:active {
+            transform: scale(.97);
+        }
+
+        .btn-submit:disabled {
+            opacity: .4;
+            cursor: default;
+        }
+
+        .btn-submit[data-type="masuk"] {
+            background: var(--green);
+            color: #071a10;
+        }
+
+        .btn-submit[data-type="keluar"] {
+            background: var(--red);
+            color: #1a0707;
+        }
+
+
+        /* TAP HINT on rows */
+        .trow {
+            cursor: pointer;
+            transition: background .12s;
+        }
+
+        .trow:active td {
+            background: rgba(107, 159, 255, .08) !important;
+        }
+
+        /* ROW ACTION SHEET */
+        .row-action-info {
+            background: var(--s2);
+            border-radius: var(--r-sm);
+            border: 1px solid var(--border);
+            padding: 12px 14px;
+            margin-bottom: 14px;
+        }
+
+        .row-action-info .ra-title {
+            font-family: 'Syne', sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--text);
+            margin-bottom: 4px;
+        }
+
+        .row-action-info .ra-sub {
+            font-size: 12px;
+            color: var(--muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .btn-row-edit {
+            width: 100%;
+            padding: 13px;
+            border: 1.5px solid var(--accent);
+            background: transparent;
+            border-radius: var(--r);
+            font-family: 'Syne', sans-serif;
+            font-size: 13.5px;
+            font-weight: 700;
+            color: var(--accent);
+            cursor: pointer;
+            transition: background .15s;
+            margin-bottom: 8px;
+        }
+
+        .btn-row-edit:active {
+            background: rgba(107, 159, 255, .1);
+        }
+
+        .btn-row-delete {
+            width: 100%;
+            padding: 13px;
+            border: none;
+            border-radius: var(--r);
+            background: var(--red-b);
+            color: var(--red);
+            border: 1px solid var(--red);
+            font-family: 'Syne', sans-serif;
+            font-size: 13.5px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: filter .15s;
+        }
+
+        .btn-row-delete:active {
+            filter: brightness(.85);
+        }
+
+        /* CONFIRM DELETE MODAL */
+        .confirm-body {
+            padding: 0 18px 18px;
+        }
+
+        .confirm-desc {
+            background: var(--red-b);
+            border: 1px solid var(--red);
+            border-radius: var(--r-sm);
+            padding: 12px 14px;
+            margin-bottom: 14px;
+            font-size: 12.5px;
+            color: var(--red);
+            line-height: 1.5;
+        }
+
+        .confirm-desc strong {
+            display: block;
+            font-size: 13px;
+            margin-bottom: 6px;
+            color: var(--text);
+        }
+
+        .confirm-btns {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .btn-cancel {
+            padding: 13px;
+            border: 1.5px solid var(--border);
+            background: transparent;
+            border-radius: var(--r);
+            font-family: 'Syne', sans-serif;
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--muted);
+            cursor: pointer;
+        }
+
+        .btn-cancel:active {
+            background: var(--s2);
+        }
+
+        .btn-confirm-del {
+            padding: 13px;
+            border: none;
+            border-radius: var(--r);
+            background: var(--red);
+            color: #1a0707;
+            font-family: 'Syne', sans-serif;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: filter .15s;
+        }
+
+        .btn-confirm-del:active {
+            filter: brightness(.85);
+        }
+
+        .btn-confirm-del:disabled {
+            opacity: .4;
+            cursor: default;
+        }
+
+        /* TOAST */
+        .toast {
+            position: fixed;
+            top: 14px;
+            left: 50%;
+            transform: translateX(-50%) translateY(-70px);
+            background: var(--s2);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 8px 16px;
+            border-radius: 40px;
+            font-size: 13px;
+            font-weight: 500;
+            z-index: 999;
+            white-space: nowrap;
+            box-shadow: 0 8px 28px rgba(0, 0, 0, .5);
+            transition: transform .25s cubic-bezier(.32, .72, 0, 1);
+        }
+
+        .toast.show {
+            transform: translateX(-50%) translateY(0);
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="toast" id="toast"></div>
+
+    <!-- HEADER -->
+    <div class="header">
+        <div class="logo">💰</div>
+        <div>
+            <h1>Rekapitulasi Dana Kas</h1>
+            <p id="tgUser">Memuat…</p>
+        </div>
+    </div>
+
+    <!-- SALDO -->
+    <div class="card">
+        <div class="saldo-lbl">Balance Saat Ini</div>
+        <div id="saldo">Rp —</div>
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-val g" id="statIn">—</div>
+                <div class="stat-lbl">Total Uang Masuk</div>
+            </div>
+            <div class="stat">
+                <div class="stat-val r" id="statOut">—</div>
+                <div class="stat-lbl">Total Uang Keluar</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ARCHIVE BANNER — muncul otomatis kalau ada data tahun lalu -->
+    <div id="archiveBanner">
+        <div class="archive-icon">📦</div>
+        <div class="archive-text">
+            <strong>Ada data yang perlu diarsip</strong>
+            <span>Tersedia data dari tahun:</span>
+            <div id="archiveYearList"></div>
+        </div>
+    </div>
+
+    <!-- ACTIONS -->
+    <div class="actions">
+        <button class="btn-action btn-masuk" onclick="openModal('masuk')">
+            <span class="btn-icon">↑</span> In
+        </button>
+        <button class="btn-action btn-keluar" onclick="openModal('keluar')">
+            <span class="btn-icon">↓</span> Out
+        </button>
+    </div>
+
+    <!-- LIST -->
+    <div class="list-meta">
+        <span><span class="live-dot"></span>Realtime</span>
+        <span id="txCount">—</span>
+    </div>
+    <div class="tx-list" id="txList">
+        <div class="empty">
+            <div class="ei">⏳</div>
+            <p>Memuat…</p>
+        </div>
+    </div>
+
+    <!-- MODAL: INPUT TRANSAKSI -->
+    <div class="overlay" id="overlay">
+        <div class="modal">
+            <div class="handle"></div>
+            <div class="modal-hd">
+                <div class="modal-hd-title" id="modalTitle">↑ Uang Masuk</div>
+                <button class="modal-close" onclick="closeModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="field">
+                    <label>Tanggal</label>
+                    <input id="inputTanggal" type="date" />
+                </div>
+                <div class="field">
+                    <label>Nominal (Rp)</label>
+                    <input id="inputNominal" type="number" inputmode="numeric" placeholder="0" min="1" />
+                </div>
+                <div class="field">
+                    <label>Template Keterangan</label>
+                    <div class="sel-wrap">
+                        <select id="ketSelect" onchange="onSelectTemplate(this.value)">
+                            <option value="">— Pilih template (opsional) —</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="field">
+                    <label>Keterangan</label>
+                    <input id="inputKet" type="text" placeholder="Ketik atau lanjutkan dari template…"
+                        maxlength="120" />
+                </div>
+                <button class="btn-submit" id="btnSubmit" data-type="masuk" onclick="submitForm()">
+                    Simpan Pemasukan
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: ARSIP -->
+    <div class="overlay" id="overlayArchive">
+        <div class="modal">
+            <div class="handle"></div>
+            <div class="modal-hd">
+                <div class="modal-hd-title">📦 Arsip Tahun <span id="archiveYear">—</span></div>
+                <button class="modal-close" onclick="closeArchiveModal()">✕</button>
+            </div>
+            <div class="modal-body">
+
+                <!-- Ringkasan data -->
+                <div class="archive-summary">
+                    <h3>Ringkasan Data <span id="archiveYear2"></span></h3>
+                    <div class="sum-row">
+                        <span class="sum-label">Jumlah transaksi</span>
+                        <span class="sum-val" id="archiveCount">—</span>
+                    </div>
+                    <div class="sum-row">
+                        <span class="sum-label">Total Pemasukan</span>
+                        <span class="sum-val" style="color:var(--green)" id="archiveTotalIn">—</span>
+                    </div>
+                    <div class="sum-row">
+                        <span class="sum-label">Total Pengeluaran</span>
+                        <span class="sum-val" style="color:var(--red)" id="archiveTotalOut">—</span>
+                    </div>
+                    <div class="sum-row">
+                        <span class="sum-label">Net</span>
+                        <span class="sum-val" id="archiveNet">—</span>
+                    </div>
+                </div>
+
+                <!-- Opsi 1: Download PDF saja -->
+                <button class="btn-archive-pdf" onclick="doArchivePDF()">
+                    👁 Preview &amp; Download PDF Saja
+                </button>
+
+                <!-- Peringatan -->
+                <div class="archive-warning">
+                    ⚠️ Tombol di bawah akan <strong>mengunduh PDF</strong> lalu <strong>menghapus permanen</strong>
+                    semua data tahun ini dari database. Pastikan PDF sudah tersimpan sebelum melanjutkan.
+                </div>
+
+                <!-- Opsi 2: Download + hapus -->
+                <button class="btn-archive-delete" id="btnDeleteAfter" onclick="doArchiveAndDelete()">
+                    📥 Download PDF &amp; Hapus Data
+                </button>
+
+            </div>
+        </div>
+    </div>
+
+
+    <!-- MODAL: ROW ACTION SHEET -->
+    <div class="overlay" id="overlayRowAction">
+        <div class="modal">
+            <div class="handle"></div>
+            <div class="modal-hd">
+                <div class="modal-hd-title">Pilih Aksi</div>
+                <button class="modal-close" onclick="closeRowAction()">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="row-action-info">
+                    <div class="ra-title" id="rowActionTitle">—</div>
+                    <div class="ra-sub" id="rowActionSub">—</div>
+                </div>
+                <button class="btn-row-edit" id="btnEditRow">✏️ Edit Transaksi</button>
+                <button class="btn-row-delete" id="btnDeleteRow">🗑️ Hapus Transaksi</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: CONFIRM DELETE -->
+    <div class="overlay" id="overlayConfirm">
+        <div class="modal">
+            <div class="handle"></div>
+            <div class="modal-hd">
+                <div class="modal-hd-title">🗑️ Hapus Transaksi?</div>
+                <button class="modal-close" onclick="closeConfirm()">✕</button>
+            </div>
+            <div class="confirm-body">
+                <div class="confirm-desc">
+                    <strong>Data yang akan dihapus:</strong>
+                    <span id="confirmDeleteDesc">—</span>
+                </div>
+                <div class="confirm-btns">
+                    <button class="btn-cancel" onclick="closeConfirm()">Batal</button>
+                    <button class="btn-confirm-del" id="btnConfirmDelete">Ya, Hapus</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+
+</html>
